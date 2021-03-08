@@ -15,6 +15,7 @@ import javax.xml.namespace.QName;
 import javax.xml.stream.XMLEventReader;
 import javax.xml.stream.XMLInputFactory;
 import javax.xml.stream.XMLStreamException;
+import javax.xml.stream.XMLStreamReader;
 import javax.xml.stream.events.StartElement;
 import javax.xml.stream.events.XMLEvent;
 
@@ -90,14 +91,17 @@ public class ParseWikipedia {
     @Override
     public void run() {
       final XMLInputFactory factory = XMLInputFactory.newInstance();
+      // 设置entity size , 否则会报 JAXP00010004 错误 但是仍然会在4200w行左右出错
+      factory.setProperty("http://www.oracle.com/xml/jaxp/properties/totalEntitySizeLimit", Integer.MAX_VALUE);
       try (InputStream fin2 = Util.openInput(fname)) {
         XMLEventReader eventReader = factory.createXMLEventReader(fin2, "UTF-8");
-
+        //XMLStreamReader eventReader = factory.createXMLStreamReader(fin2, "UTF-8");
         while(eventReader.hasNext()) {
           XMLEvent event = eventReader.nextEvent();
           if(event.isStartElement()) {
             StartElement startElement = event.asStartElement();
-            if(startElement.getName().getLocalPart() == "page") {
+            String name = startElement.getName().getLocalPart();
+            if(name.equals("page")) {
               parsePage(eventReader);
               // if (readprog.get() == 10000) break;
             }
@@ -233,6 +237,7 @@ public class ParseWikipedia {
       if(title.startsWith("List ") || title.startsWith("Liste ") || title.startsWith("Anexo:"))
         return;
       String text = Util.removeEntities(a.rawtext);
+      //存在重定向
       if(a.redirect != null) {
         redirmatcher.reset(text);
         String anchor = "", redirect;
@@ -249,6 +254,7 @@ public class ParseWikipedia {
         handler.redirect(a.prefix, title, redirect, anchor);
         return;
       }
+      //不存在重定向
       // Note: removing some of these too early will break redirects!
       text = Util.removeSpecial(text);
       handler.rawArticle(a.prefix, title, text);
@@ -261,6 +267,7 @@ public class ParseWikipedia {
    * @param args Command line attributes
    */
   public static void main(String[] args) {
+    //多线程
     int par = Math.min(Integer.valueOf(Config.get("parallelism")), Runtime.getRuntime().availableProcessors());
     if(par < 1) {
       throw new Error("At least 1 consumer must be allowed!");
@@ -271,8 +278,10 @@ public class ParseWikipedia {
 
       BlockingQueue<Article> q1 = new ArrayBlockingQueue<>(100);
       ParseWikipedia l = new ParseWikipedia();
-      // Start the reader:
+      // Start the reader: 要处理的数据来源，如果处理多个，中间使用逗号分割
+      //创建线程，解析XML文件，并生成Article
       for(String s : Config.get("loader.source").split(",")) {
+        //获取文件名，并按-分割，得到的如enwiki:、dewiki等
         String p = new File(s).getName().split("-")[0] + ":";
         Thread reader = l.makeReaderThread(s, p, q1);
         threads.add(reader);
@@ -282,6 +291,10 @@ public class ParseWikipedia {
       LinkCollector lc = new LinkCollector(Config.get("links.output"));
       LuceneLinkTokenizer lt = new LuceneLinkTokenizer(Config.get("linktext.output"));
       System.err.println("Starting " + par + " worker threads.");
+      //创建若干个消费进程 每个消费进程都会有若干个handler，包括RedirectHandler、IndexHandler(包含了LinkHandler和LuceneLinkHandler)
+      //其中RedirectHandler负责生成redirect.gz文件，格式为"{prefix}{title}" "{prefix}{redirect}[\t{anchor}]"
+      //IndexHandler负责以title、text和解析出的link文本生成Document(全文检索？)它会解析出link，并传递给LinkHandler
+      //同时还会交给LiceneHandler，对link文本进行分词
       for(int i = 0; i < par; i++) {
         HandlerList h = new HandlerList(), h2 = new HandlerList();
         Thread a = l.makeParserThread(q1, h);

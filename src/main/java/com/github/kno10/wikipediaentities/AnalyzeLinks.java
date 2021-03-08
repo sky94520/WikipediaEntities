@@ -53,6 +53,7 @@ public class AnalyzeLinks {
   IndexSearcher searcher;
 
   private void run() throws IOException {
+    //最多允许的线程数量
     int par = Math.min(Integer.valueOf(Config.get("parallelism")), Runtime.getRuntime().availableProcessors());
     if(par < 1) {
       throw new Error("At least 1 consumer must be allowed!");
@@ -62,6 +63,7 @@ public class AnalyzeLinks {
     Unique<String> unique = new Unique<>(50_000_000);
     // Load Wikidata information:
     Map<String, String> datamap = loadWikidata(unique, Config.get("wikidata.output"));
+    //Map<String, String> datamap = loadWikidata(unique, "wiki-2021/wikidata1.tsv.gz");
     System.out.format("Read %d wikidata maps.\n", datamap.size());
     // Load redirects
     Reference2ReferenceOpenHashMap<String, String> redmap = loadRedirects(unique, Config.get("redirects.output"));
@@ -77,7 +79,7 @@ public class AnalyzeLinks {
     FSDirectory ldir = FSDirectory.open(FileSystems.getDefault().getPath(dir));
     IndexReader reader = DirectoryReader.open(ldir);
     searcher = new IndexSearcher(reader);
-
+    //添加一个输出线程，若干个工作线程
     ArrayList<Thread> threads = new ArrayList<>();
     threads.add(new OutputThread(out));
     for(int i = 0; i < par; i++)
@@ -180,22 +182,32 @@ public class AnalyzeLinks {
     ObjectOpenHashSet<String> seen = new ObjectOpenHashSet<>();
     // Iterate using a copy to avoid concurrent modification
     int i = 0;
+    int total_size = redmap.size();
     for(ObjectIterator<Reference2ReferenceOpenHashMap.Entry<String, String>> it = redmap.reference2ReferenceEntrySet().fastIterator(); it.hasNext();) {
-      if(++i % 1_000_000 == 0) {
-        System.out.format("Computing closure progress: %d\n", i);
+      if(++i % 1000 == 0) {
+        System.out.format("Computing closure progress: %d/%d\n", i, total_size);
       }
       Reference2ReferenceOpenHashMap.Entry<String, String> ent = it.next();
+      //key -> targ
       String key = ent.getKey(), targ = ent.getValue();
       assert (targ != null);
+      //key对应的真实词条，让targ->词条
       String next = datamap.get(key);
       if(next != null) {
+        //在数据中存在该映射，链式插入短语
         do {
-          if(datamap.put(targ, next) == null) {
-            // System.err.format("Warning: WikiData references a redirect: %s >
-            // %s > %s\n", next, key, targ);
-          }
-        }
-        while((targ = redmap.get(targ)) != null);
+          //旧值；如果给定键不存在任何值，则返回null。
+          String oldVal = datamap.put(targ, next);
+            if (oldVal == null)
+            {
+              System.err.format("Warning: WikiData references a redirect: %s > %s > %s\n", next, key, targ);
+            }
+            //TODO:值相同，跳出
+            else if (oldVal.equals(next))
+            {
+              break;
+            }
+        }while((targ = redmap.get(targ)) != null);
         continue;
       }
       seen.clear();
@@ -281,11 +293,15 @@ public class AnalyzeLinks {
     }
 
     private void analyze(Candidate cand) throws IOException {
+      //TODO: 和lucene相关，查询
       PhraseQuery.Builder pq = new PhraseQuery.Builder();
+      //字是按照空格划分的
       for(String t : cand.query.split(" "))
         pq.add(new Term(LuceneWikipediaIndexer.LUCENE_FIELD_TEXT, t));
+      //每次查询前都清空原先的数据
       counters.clear();
       // Careful: max count must be less than 64k, because we use short counts!
+      //通过字查询文档
       TopDocs res = searcher.search(pq.build(), 0xFFFF);
       ScoreDoc[] docs = res.scoreDocs;
       if(docs.length < MINIMUM_MENTIONS) {
@@ -293,9 +309,12 @@ public class AnalyzeLinks {
         return; // Too rare.
       }
       int minsupp = Math.max(MINIMUM_MENTIONS, docs.length / 10);
+      //计算这些文档中的link短语，若有一个短语有对应的datamap，则增加1（每个文档增加1）
       int weight = 0;
+      //遍历所有文档 以及对应的所有link
       for(int i = 0; i < docs.length; ++i) {
         Document d = searcher.doc(docs[i].doc);
+        //获取游文档对应的自由链接词语
         String[] lis = d.get(LuceneWikipediaIndexer.LUCENE_FIELD_LINKS).split("\t");
         if(lis.length == 0) {
           // String dtitle = d.get(LuceneWikipediaIndexer.LUCENE_FIELD_TITLE);
@@ -314,16 +333,18 @@ public class AnalyzeLinks {
               counters.addTo(targ, 1);
               used = true;
             }
+            //还有短语 并且这个短语等于查询 并且未曾添加到dupsExact，则为它添加权重65536
             if(j + 1 < lis.length && lis[j + 1].equalsIgnoreCase(cand.query) && dupsExact.add(targ))
               counters.addTo(targ, EXACT);
-          }
-        }
+          }//end if
+        }//end for 遍历文档中的link短语
         if(used)
           weight++;
-      }
+      }//end for 遍历文档
       boolean output = false;
       if(counters.size() > 0) {
         buf.setLength(0); // clear
+        //查询语句 总文档数 weight：在wikidata中的不重复关键字数
         buf.append(cand.query);
         buf.append('\t').append(res.totalHits);
         buf.append('\t').append(weight);
@@ -331,6 +352,7 @@ public class AnalyzeLinks {
         int max = weight;
         // int max = Math.max(docs.length, sorted.get(0).getCombinedCount());
         final double norm = Math.log1p(.1 * max);
+        //记录每个短语以及对应出现的次数
         for(CounterSet.Entry<String> c : sorted) {
           final int count = c.getSearchCount();
           if(count < minsupp)
@@ -359,9 +381,9 @@ public class AnalyzeLinks {
         monitor.notifyAll();
       }
     }
-  }
-
+  }//end for WorkerThread
   public void readall(String nam) {
+    //open linktext.gz
     try (InputStream in = Util.openInput(nam);
         BufferedReader r = new BufferedReader(new InputStreamReader(in))) {
       String line;
@@ -384,7 +406,7 @@ public class AnalyzeLinks {
     }
     shutdown = true; // Don't wait for more input to arrive.
   }
-
+  //实体输出线程处理类
   private class OutputThread extends Thread {
     private String nam;
 
@@ -395,12 +417,16 @@ public class AnalyzeLinks {
 
     @Override
     public void run() {
+      //定时查询队列，如果获取到，则判断有没有匹配到的数据，有则输出到文件
       try (PrintStream out = Util.openOutput(nam)) {
         while(!outqueue.isEmpty() || !shutdown) {
           try {
+            //一定时间从队列取数据，若未取到，返回null
+            //检索并除去此队列的头，如果有必要使元素可用，则等待指定的等待时间。
             Candidate a = outqueue.poll(100, TimeUnit.MILLISECONDS);
             if(a == null)
               continue;
+            //拿到一个 candidate，若还没查询，则一直等待处理后，才被唤醒
             while(true) {
               if(a.query == null)
                 break; // Query failed to yield good results.
@@ -412,7 +438,7 @@ public class AnalyzeLinks {
               synchronized(monitor) {
                 monitor.wait(); // Wait for wakeup signal
               }
-            }
+            }//end while
           }
           catch(InterruptedException e) {
             break;

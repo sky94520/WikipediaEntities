@@ -41,6 +41,7 @@ public class LuceneWikipediaIndexer {
 
   /** Lucene index writer */
   private IndexWriter index;
+  private FSDirectory ldir;
 
   /**
    * Constructor
@@ -49,7 +50,7 @@ public class LuceneWikipediaIndexer {
    * @throws IOException on errors opening the lucene index
    */
   public LuceneWikipediaIndexer(String dir) throws IOException {
-    FSDirectory ldir = FSDirectory.open(FileSystems.getDefault().getPath(dir));
+    ldir = FSDirectory.open(FileSystems.getDefault().getPath(dir));
     IndexWriterConfig config = new IndexWriterConfig(new StandardAnalyzer());
     index = new IndexWriter(ldir, config);
   }
